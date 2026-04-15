@@ -9,16 +9,22 @@ from passlib.context import CryptContext
 from pydantic import BaseModel
 import requests
 import json
+import os
 
-# --- 1. الإعدادات النهائية (Production Settings) ---
-SECRET_KEY = "SAFETY_PRO_2026_EGY_ULTIMATE"
+# --- 1. الإعدادات المؤمنة (Production Ready) ---
+# يقرأ من Vercel Settings وإذا لم يجد يستخدم قيمة افتراضية (للمحلي فقط)
+SECRET_KEY = os.getenv("SECRET_KEY", "SAFETY_PRO_2026_DEFAULT_KEY")
 ALGORITHM = "HS256"
-# مفتاح Groq الخاص بك (مؤمن وجاهز)
-GROQ_API_KEY = "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" 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") 
+
+# تعديل DATABASE_URL ليتناسب مع SQLAlchemy (خاصة لو Postgres)
+db_url = os.getenv("DATABASE_URL", "sqlite:///./safetypro.db")
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 Base = declarative_base()
-engine = create_engine("sqlite:///./safetypro.db", connect_args={"check_same_thread": False})
+engine = create_engine(db_url)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # --- 2. قاعدة البيانات ---
@@ -39,9 +45,10 @@ class PlanDB(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     owner = relationship("UserDB", back_populates="plans")
 
+# إنشاء الجداول
 Base.metadata.create_all(bind=engine)
 
-# --- 3. النماذج ---
+# --- 3. النماذج (Schemas) ---
 class UserCreate(BaseModel):
     full_name: str
     email: str
@@ -56,7 +63,7 @@ app = FastAPI(title="SafetyPro 2026 Ultimate")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # مهم جداً للوصول من الموبايل أو أي دومين خارجي
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,18 +72,26 @@ app.add_middleware(
 # --- 5. الدوال المساعدة ---
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try: 
+        yield db
+    finally: 
+        db.close()
 
 def verify_token(authorization: str = Header(None)):
-    if not authorization: raise HTTPException(status_code=401, detail="Session Expired")
+    if not authorization: 
+        raise HTTPException(status_code=401, detail="Session Expired")
     try:
         token = authorization.split(" ")[1] if " " in authorization else authorization
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload.get("sub")
-    except: raise HTTPException(status_code=401, detail="Invalid Session")
+    except: 
+        raise HTTPException(status_code=401, detail="Invalid Session")
 
-# --- 6. المسارات (Authentication) ---
+# --- 6. المسارات الرئيسية ---
+@app.get("/")
+def root():
+    return {"status": "Active", "service": "SafetyPro API 2026"}
+
 @app.post("/auth/register")
 async def register(user: UserCreate, db: Session = Depends(get_db)):
     if db.query(UserDB).filter(UserDB.email == user.email).first():
@@ -91,10 +106,9 @@ async def login(user: UserLogin, db: Session = Depends(get_db)):
     db_user = db.query(UserDB).filter(UserDB.email == user.email).first()
     if not db_user or not pwd_context.verify(user.password, db_user.hashed_password):
         raise HTTPException(status_code=401, detail="بيانات خاطئة")
-    token = jwt.encode({"sub": db_user.email}, SECRET_KEY, algorithm=ALGORITHM)
+    token = jwt.encode({"sub": db_user.email, "exp": datetime.utcnow() + timedelta(days=7)}, SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": token, "user": {"full_name": db_user.full_name}}
 
-# --- 7. توليد الخطط (The Engine) ---
 @app.post("/generate-plan")
 async def generate(data: dict, db: Session = Depends(get_db), user_email: str = Depends(verify_token)):
     project = data.get('projectName', 'General Project')
@@ -110,7 +124,7 @@ async def generate(data: dict, db: Session = Depends(get_db), user_email: str = 
     )
     
     payload = {
-        "model": "llama-3.1-8b-instant", # الموديل الأحدث والمستقر حالياً
+        "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.4,
         "max_tokens": 3000
@@ -119,15 +133,10 @@ async def generate(data: dict, db: Session = Depends(get_db), user_email: str = 
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=40)
         res_data = res.json()
-        
-        # معالجة ذكية للرد لتجنب أخطاء المفاتيح المفقودة
-        if "choices" in res_data and len(res_data["choices"]) > 0:
+        if "choices" in res_data:
             ai_text = res_data['choices'][0]['message']['content']
-        elif "error" in res_data:
-            ai_text = f"⚠️ خطأ من الذكاء الاصطناعي: {res_data['error'].get('message', 'خطأ غير معروف')}"
         else:
-            ai_text = "⚠️ لم يتم استلام رد صحيح من السيرفر."
-            
+            ai_text = "⚠️ حدث خطأ في التواصل مع الذكاء الاصطناعي."
     except Exception as e:
         ai_text = f"❌ فشل الاتصال: {str(e)}"
 
@@ -150,10 +159,11 @@ async def list_plans(db: Session = Depends(get_db), user_email: str = Depends(ve
     ]
 
 @app.delete("/delete-plan/{plan_id}")
-async def delete_plan(plan_id: int, db: Session = Depends(get_db), user_uvicorn api.main:app --reloademail: str = Depends(verify_token)):
+async def delete_plan(plan_id: int, db: Session = Depends(get_db), user_email: str = Depends(verify_token)):
     user = db.query(UserDB).filter(UserDB.email == user_email).first()
     plan = db.query(PlanDB).filter(PlanDB.id == plan_id, PlanDB.user_id == user.id).first()
     if plan:
         db.delete(plan)
         db.commit()
-    return {"status": "deleted"}
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="الخطة غير موجودة")
